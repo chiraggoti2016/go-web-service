@@ -1,87 +1,197 @@
 package main
 
 import (
+    "database/sql"
     "encoding/json"
     "fmt"
     "log"
     "net/http"
+    "strconv"
 
     "github.com/gorilla/mux"
+    _ "github.com/go-sql-driver/mysql"
 )
 
-// Book struct to represent a book resource
 type Book struct {
-    ID     string `json:"id"`
+    ID     int    `json:"id"`
     Title  string `json:"title"`
     Author string `json:"author"`
     Year   string `json:"year"`
 }
 
-// Books slice to seed initial data
-var books []Book
+var db *sql.DB
+var err error
 
-// getBooks function to return all books
+// Database connection string
+const (
+    dbUser     = "root"
+    dbPassword = "1234"
+    dbName     = "bookdb"
+)
+
+func initDB() {
+    dsn := fmt.Sprintf("%s:%s@tcp(127.0.0.1:3306)/%s", dbUser, dbPassword, dbName)
+
+    db, err = sql.Open("mysql", dsn)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    err = db.Ping()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("Successfully connected to the MySQL database!")
+}
+
+// Handlers
 func getBooks(w http.ResponseWriter, r *http.Request) {
+    rows, err := db.Query("SELECT id, title, author, year FROM books")
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+
+    var books []Book
+    for rows.Next() {
+        var book Book
+        err := rows.Scan(&book.ID, &book.Title, &book.Author, &book.Year)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        books = append(books, book)
+    }
+
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(books)
 }
 
-// getBook function to return a single book by ID
 func getBook(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    params := mux.Vars(r) // Get parameters
-    for _, item := range books {
-        if item.ID == params["id"] {
-            json.NewEncoder(w).Encode(item)
-            return
-        }
+    params := mux.Vars(r)
+    id, err := strconv.Atoi(params["id"])
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
     }
-    http.NotFound(w, r)
-}
 
-// createBook function to add a new book
-func createBook(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
     var book Book
-    _ = json.NewDecoder(r.Body).Decode(&book)
-    book.ID = fmt.Sprintf("%d", len(books)+1) // Generate a new ID
-    books = append(books, book)
+    err = db.QueryRow("SELECT id, title, author, year FROM books WHERE id=?", id).Scan(&book.ID, &book.Title, &book.Author, &book.Year)
+    if err == sql.ErrNoRows {
+        http.Error(w, "Book not found", http.StatusNotFound)
+        return
+    } else if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(book)
 }
 
-// deleteBook function to remove a book by ID
-func deleteBook(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    params := mux.Vars(r)
-    for index, item := range books {
-        if item.ID == params["id"] {
-            books = append(books[:index], books[index+1:]...)
-            break
-        }
+func createBook(w http.ResponseWriter, r *http.Request) {
+    var book Book
+    err := json.NewDecoder(r.Body).Decode(&book)
+    if err != nil {
+        http.Error(w, "Invalid input", http.StatusBadRequest)
+        return
     }
-    json.NewEncoder(w).Encode(books)
+
+    sqlStatement := `INSERT INTO books (title, author, year) VALUES (?, ?, ?)`
+    result, err := db.Exec(sqlStatement, book.Title, book.Author, book.Year)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    id, _ := result.LastInsertId()
+    book.ID = int(id)
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(book)
 }
 
-// initializeBooks to add some initial data
-func initializeBooks() {
-    books = append(books, Book{ID: "1", Title: "1984", Author: "George Orwell", Year: "1949"})
-    books = append(books, Book{ID: "2", Title: "The Catcher in the Rye", Author: "J.D. Salinger", Year: "1951"})
+func updateBook(w http.ResponseWriter, r *http.Request) {
+    params := mux.Vars(r)
+    id, err := strconv.Atoi(params["id"])
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
+    }
+
+    var book Book
+    err = json.NewDecoder(r.Body).Decode(&book)
+    if err != nil {
+        http.Error(w, "Invalid input", http.StatusBadRequest)
+        return
+    }
+
+    sqlStatement := `UPDATE books SET title=?, author=?, year=? WHERE id=?`
+    res, err := db.Exec(sqlStatement, book.Title, book.Author, book.Year, id)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    count, err := res.RowsAffected()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if count == 0 {
+        http.Error(w, "Book not found", http.StatusNotFound)
+        return
+    }
+
+    book.ID = id
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(book)
+}
+
+func deleteBook(w http.ResponseWriter, r *http.Request) {
+    params := mux.Vars(r)
+    id, err := strconv.Atoi(params["id"])
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
+    }
+
+    sqlStatement := `DELETE FROM books WHERE id=?`
+    res, err := db.Exec(sqlStatement, id)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    count, err := res.RowsAffected()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if count == 0 {
+        http.Error(w, "Book not found", http.StatusNotFound)
+        return
+    }
+
+    w.WriteHeader(http.StatusNoContent)
 }
 
 func main() {
-    // Initialize sample data
-    initializeBooks()
+    // Initialize DB
+    initDB()
 
-    // Initialize router
+    // Initialize Router
     r := mux.NewRouter()
 
-    // Route handlers
+    // Route Handlers
     r.HandleFunc("/api/books", getBooks).Methods("GET")
     r.HandleFunc("/api/books/{id}", getBook).Methods("GET")
     r.HandleFunc("/api/books", createBook).Methods("POST")
+    r.HandleFunc("/api/books/{id}", updateBook).Methods("PUT")
     r.HandleFunc("/api/books/{id}", deleteBook).Methods("DELETE")
 
-    // Start server
-    fmt.Println("Server running on port 8000")
+    fmt.Println("Server is running on port 8000")
     log.Fatal(http.ListenAndServe(":8000", r))
 }
